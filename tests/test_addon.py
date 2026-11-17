@@ -2,20 +2,40 @@
 # requires-python = ">=3.11"
 # dependencies = ["lupa>=2.0"]
 # ///
-"""Tests für GoldPerHour ohne Spiel: das Addon läuft in Lua mit nachgebauter WoW-API.
+"""Tests for GoldPerHour without the game: the addon runs in Lua against a stubbed WoW API.
 
     uv run tests/test_addon.py
-    uv run tests/test_addon.py --dump <Datei>   schreibt GoldPerHourDB am Ende des Hauptszenarios als
-                                                SavedVariables-Datei (Testdaten für die Desktop-App)
+    uv run tests/test_addon.py --dump <file>   writes GoldPerHourDB at the end of the main scenario as a
+                                               SavedVariables file (test data for the desktop app)
 """
 
 import os
+import re
 import sys
 
 from lupa.lua54 import LuaRuntime, lua_type
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ADDON = os.path.join(HERE, "..", "GoldPerHour.lua")
+ROOT = os.path.join(HERE, "..")
+NAME = "GoldPerHour"
+
+
+def read(name):
+    with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def toc():
+    """Fields and file list of the .toc."""
+    fields, files = {}, []
+    for line in read(f"{NAME}.toc").splitlines():
+        line = line.strip()
+        m = re.match(r"##\s*([^:]+):\s*(.*)$", line)
+        if m:
+            fields[m.group(1)] = m.group(2)
+        elif line and not line.startswith("#"):
+            files.append(line.replace("\\", "/"))
+    return fields, files
 
 
 def lua_to_py(x):
@@ -58,7 +78,7 @@ return function(name, v) return name .. " = " .. ser(v, "") .. "\n" end
 # Just enough of the client for GoldPerHour.lua: frames swallow every method, events go to the frame of
 # the last load (a /reload re-runs the file against the same GoldPerHourDB).
 STUBS = r"""
-now, money, zone = 100, 10000, "Brachland"
+now, money, zone, locale = 100, 10000, "The Barrens", "enUS"
 loot = {}
 tickers = {}
 handler = nil
@@ -77,28 +97,28 @@ function CreateFrame() return setmetatable({}, frameMeta) end
 UIParent = CreateFrame()
 GameTooltip = setmetatable({ IsOwned = function() return false end }, frameMeta)
 function fire(event, ...) handler(nil, event, ...) end
-function GetLocale() return "deDE" end
+function GetLocale() return locale end
 Enum = { LootSlotType = { Item = 1 } }
 function GetTime() return now end
 function time() return 1763400000 + now end
 function GetMoney() return money end
 function GetMoneyString(c) return tostring(c) end
 function GetRealZoneText() return zone end
-function UnitName() return "Malgruk" end
+function UnitName() return "Tester" end
 function wipe(t) for k in pairs(t) do t[k] = nil end return t end
 function strsplit(sep, s) return s:match("^([^" .. sep .. "]*)") end
 StaticPopupDialogs = {}
 SlashCmdList = {}
-YES, NO = "Ja", "Nein"
+YES, NO = "Yes", "No"
 printed = {}
 function print(...) printed[#printed + 1] = table.concat({...}, " ") end
 C_Timer = { NewTicker = function(_, fn) tickers[#tickers + 1] = fn end }
 function tick() tickers[#tickers]() end
-C_AddOns = { GetAddOnMetadata = function() return "0.3.0" end }
-C_Spell = { GetSpellName = function(id) return id == 2366 and "Kräutersammeln" or "Anderes" end }
--- Item 2447 (Friedensblume): sells for 10 copper, Auctionator says 1000.
+C_AddOns = { GetAddOnMetadata = function() return VERSION end }
+C_Spell = { GetSpellName = function(id) return id == 2366 and "Herb Gathering" or "Something else" end }
+-- Item 2447 (Peacebloom): sells for 10 copper, Auctionator says 1000.
 C_Item = {
-  GetItemInfo = function(link) return "Friedensblume", link, 1, 5, 0, "", "", 20, "", 0, 10, 7, 9, 0 end,
+  GetItemInfo = function(link) return "Peacebloom", link, 1, 5, 0, "", "", 20, "", 0, 10, 7, 9, 0 end,
   GetItemIconByID = function() return 134400 end,
 }
 Item = { CreateFromItemLink = function(_, link)
@@ -114,22 +134,33 @@ function GetLootSlotLink(i) return loot[i] and loot[i].link end
 function GetLootSlotInfo(i) return nil, nil, loot[i] and loot[i].qty end
 """
 
-LINK = "|cffffffff|Hitem:2447::::::::20:::::|h[Friedensblume]|h|r"
+LINK = "|cffffffff|Hitem:2447::::::::20:::::|h[Peacebloom]|h|r"
 
 
-def new_runtime():
+def new_runtime(locale="enUS"):
     lua = LuaRuntime(register_eval=False)
     lua.execute(STUBS)
     lua.globals().LINK = LINK
+    lua.globals().locale = locale
+    lua.globals().VERSION = toc()[0]["Version"]
     return lua
 
 
 def load_addon(lua, request=None):
-    """Runs the addon file like the client does on login or /reload."""
-    lua.execute(f"GoldPerHour_AppRequest = {request or 'nil'}")
-    chunk = lua.eval("function(src) return assert(load(src, 'GoldPerHour.lua')) end")(open(ADDON, encoding="utf-8").read())
-    chunk("GoldPerHour")
+    """Runs the files of the .toc like the client does on login or /reload: in order, sharing one table."""
+    load = lua.eval("function(src, name) return assert(load(src, name)) end")
+    ns = lua.table()
+    for name in toc()[1]:
+        if name == "AppRequest.lua":
+            lua.execute(f"GoldPerHour_AppRequest = {request or 'nil'}")
+        else:
+            load(read(name), name)(NAME, ns)
     lua.execute('fire("ADDON_LOADED", "GoldPerHour"); fire("PLAYER_LOGIN")')
+    return ns
+
+
+def printed(lua):
+    return values(lua_to_py(lua.globals().printed))
 
 
 def mob_loot(lua, qty=3, coins=500):
@@ -152,7 +183,7 @@ def test_session_reload_request_and_history():
     lua.execute("now = now + 400; tick()")
     d = db(lua)
     assert d["gold"]["loot"] == 3 * 1000 + 500 and d["coin"]["loot"] == 500, d["gold"]
-    assert d["session"]["zones"] == {"Brachland": 3500} and d["session"]["chars"] == {"Malgruk": True}
+    assert d["session"]["zones"] == {"The Barrens": 3500} and d["session"]["chars"] == {"Tester": True}
     assert [s[0] for s in values(d["session"]["samples"])] == [0, 400]
 
     # /reload: PLAYER_LOGOUT pauses and remembers the running session, the new load resumes it.
@@ -161,7 +192,7 @@ def test_session_reload_request_and_history():
     assert d["resume"] is True and d["elapsed"] == 400 and d["updated"]
     load_addon(lua)
     lua.execute('fire("PLAYER_ENTERING_WORLD", false, true); now = now + 100')
-    assert any("weiter" in p for p in values(lua_to_py(lua.globals().printed)))
+    assert any("session continues after /reload" in p for p in printed(lua))
     lua.execute('fire("PLAYER_LOGOUT")')
     assert db(lua)["elapsed"] == 500
 
@@ -176,7 +207,7 @@ def test_session_reload_request_and_history():
     assert d["elapsed"] == 0 and d["gold"]["loot"] == 0 and d.get("resume") is None
     hist = values(d["history"])
     assert len(hist) == 1 and hist[0]["elapsed"] == 500 and hist[0]["gold"]["loot"] == 3500
-    assert hist[0]["items"]["loot"] == [{"id": 2447, "name": "Friedensblume", "quality": 1, "count": 3, "value": 3000}]
+    assert hist[0]["items"]["loot"] == [{"id": 2447, "name": "Peacebloom", "quality": 1, "count": 3, "value": 3000}]
 
     # autoStart: the next loot window starts the session; priceSource vendor values the herb at 10 copper.
     mob_loot(lua, qty=2, coins=0)
@@ -227,14 +258,52 @@ def test_login_does_not_resume():
     print("ok test_login_does_not_resume")
 
 
+def test_locales():
+    # A translation may only use keys that exist in English, with the same %d placeholders.
+    texts = {}
+    for locale in ("enUS", "deDE", "frFR"):
+        lua = new_runtime(locale)
+        texts[locale] = lua_to_py(load_addon(lua).L)
+    assert texts["frFR"] == texts["enUS"], "an unknown locale falls back to English"
+    assert texts["deDE"].keys() == texts["enUS"].keys()
+    assert texts["deDE"]["perHour"] == "pro Stunde" and texts["enUS"]["perHour"] == "per hour"
+    for key, text in texts["enUS"].items():
+        assert re.findall(r"%[ds]", text) == re.findall(r"%[ds]", texts["deDE"][key]), key
+
+    # A German client prints German.
+    lua = new_runtime("deDE")
+    load_addon(lua)
+    lua.execute('fire("PLAYER_ENTERING_WORLD", true, false)')
+    lua.globals().SlashCmdList.GOLDPERHOUR("herbid 99")
+    lua.globals().SlashCmdList.GOLDPERHOUR("nonsense")
+    out = printed(lua)
+    assert any("Zauber 99 zählt jetzt als Kräutersammeln" in p for p in out), out
+    assert any("<ZauberID>" in p for p in out), out
+    print("ok test_locales")
+
+
+def test_toc():
+    fields, files = toc()
+    assert fields["Interface"] == "16001" and re.fullmatch(r"\d+\.\d+\.\d+", fields["Version"]), fields
+    assert files and files[-1] == f"{NAME}.lua"
+    for name in files:
+        assert os.path.isfile(os.path.join(ROOT, name)), f"{name} is listed in the .toc but missing"
+    for name in os.listdir(ROOT):
+        if name.endswith((".lua", ".xml")):
+            assert name in files, f"{name} is not listed in the .toc"
+    print("ok test_toc")
+
+
 if __name__ == "__main__":
     final = test_session_reload_request_and_history()
     test_herb_gathering()
     test_login_does_not_resume()
+    test_locales()
+    test_toc()
     if "--dump" in sys.argv:
         target = sys.argv[sys.argv.index("--dump") + 1]
         text = final.execute(SERIALIZE)("GoldPerHourDB", final.globals().GoldPerHourDB)
         os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
         with open(target, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n" + text)
-        print(f"geschrieben: {target}")
+        print(f"written: {target}")

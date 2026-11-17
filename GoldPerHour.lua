@@ -1,16 +1,16 @@
-local ADDON = ...
+local ADDON, ns = ...
 
 local HERB, LOOT = "herb", "loot"
 local CATEGORIES = { HERB, LOOT }
 
 local CAST_WINDOW = 15      -- seconds between the gathering cast and its loot
 local MONEY_GRACE = 1.5     -- seconds after LOOT_CLOSED in which PLAYER_MONEY still counts as loot
-local HERB_GATHERING = 2366 -- retail spell ID; add others with /gph herbid <id>
+local HERB_GATHERING = 2366 -- Herb Gathering; add other spells with /gph herbid <id>
 local SAMPLE_EVERY = 300    -- seconds of session time between two points of the gold curve
 local MAX_SAMPLES = 288     -- 24 h at 5 min; above that every second point is dropped
-local MAX_HISTORY = 100     -- finished sessions kept for the WoWMCP app
+local MAX_HISTORY = 100     -- finished sessions kept for the desktop app
 
--- Settings the WoWMCP app can change through AppRequest.lua (window visibility and herb spells live in
+-- Settings the desktop app can change through AppRequest.lua (window visibility and herb spells live in
 -- db.hidden and db.herbSpells, as before 0.3).
 local DEFAULTS = {
     scale = 1,                 -- window scale
@@ -27,37 +27,7 @@ local ICON = {
     total = "Interface\\Icons\\INV_Misc_Coin_02",
 }
 
-local L = {
-    herb = "Herbs", loot = "Loot", total = "Total", perHour = "per hour",
-    start = "Start", resume = "Resume", stop = "Stop", reset = "Reset",
-    session = "Session", running = "running", paused = "paused",
-    coins = "Coins", nothing = "Nothing yet", more = "+%d more",
-    prices = "Prices", auction = "Auctionator, vendor price as fallback",
-    vendorOnly = "vendor only (Auctionator not loaded)",
-    vendorSetting = "vendor price (setting)",
-    applied = "settings from the WoWMCP app applied",
-    resumed = "session continues after /reload",
-    hint = "Drag to move",
-    resetConfirm = "Reset the GoldPerHour session?",
-    hidden = "window hidden, /gph shows it again",
-    herbAdded = "spell %d now counts as herb gathering",
-    usage = "/gph [start | stop | reset | show | hide | debug | herbid <spellID>]",
-}
-if GetLocale() == "deDE" then
-    L.herb, L.loot, L.total, L.perHour = "Kräuter", "Loot", "Gesamt", "pro Stunde"
-    L.start, L.resume, L.stop, L.reset = "Start", "Weiter", "Stop", "Reset"
-    L.session, L.running, L.paused = "Sitzung", "läuft", "pausiert"
-    L.coins, L.nothing, L.more = "Münzen", "Noch nichts", "+%d weitere"
-    L.prices, L.auction = "Preise", "Auctionator, sonst Händlerpreis"
-    L.vendorOnly = "nur Händlerpreis (Auctionator nicht geladen)"
-    L.vendorSetting = "Händlerpreis (Einstellung)"
-    L.applied = "Einstellungen aus der WoWMCP-App übernommen"
-    L.resumed = "Sitzung läuft nach /reload weiter"
-    L.hint = "Ziehen zum Verschieben"
-    L.resetConfirm = "GoldPerHour-Sitzung zurücksetzen?"
-    L.hidden = "Fenster versteckt, /gph zeigt es wieder"
-    L.herbAdded = "Zauber %d zählt jetzt als Kräutersammeln"
-end
+local L = ns.L
 
 local db
 local running, startedAt = false, 0
@@ -213,7 +183,7 @@ local function RightAligned(font, x, y, text)
     return fs
 end
 
-RightAligned("GameFontDisableSmall", -PAD - COLUMN - 6, -34, "Gold")
+RightAligned("GameFontDisableSmall", -PAD - COLUMN - 6, -34, L.gold)
 RightAligned("GameFontDisableSmall", -PAD, -34, L.perHour)
 
 local function MakeRow(key, y, font)
@@ -550,7 +520,7 @@ function handlers.PLAYER_LOGIN()
     lastMoney = GetMoney()
 end
 
--- Requests from the WoWMCP app (AppRequest.lua in this folder, read by the client on /reload).
+-- Requests from the desktop app (AppRequest.lua in this folder, read by the client on /reload).
 -- Each id runs once; the result goes to db.lastRequest, which the app reads after the next /reload.
 local function ApplySettings(s)
     for key, default in pairs(DEFAULTS) do
@@ -727,7 +697,7 @@ SlashCmdList.GOLDPERHOUR = function(msg)
         SetVisible(false)
     elseif cmd == "debug" then
         debug = not debug
-        Print("debug", debug and "on" or "off")
+        Print(debug and L.debugOn or L.debugOff)
     elseif cmd == "herbid" and tonumber(arg) then
         db.herbSpells[tonumber(arg)] = true
         Print(L.herbAdded:format(tonumber(arg)))

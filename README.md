@@ -1,63 +1,83 @@
 # GoldPerHour
 
-Addon für World of Warcraft: Forever (Interface 16001). Ein kleines Fenster zeigt Gold und Gold pro Stunde der laufenden Sitzung, getrennt nach Kräutern und Loot.
+[![CI](https://github.com/kejith/GoldPerHour/actions/workflows/ci.yml/badge.svg)](https://github.com/kejith/GoldPerHour/actions/workflows/ci.yml)
 
-- **Kräuter** ist Loot direkt nach Kräutersammeln aus einem Weltobjekt, alles andere zählt als **Loot**.
-- Items zählen zum Auctionator-Preis, ohne Auctionator zum Händlerpreis. Graue und beim Aufheben gebundene Items zählen immer zum Händlerpreis, Münzen aus dem Lootfenster direkt.
-- Preise gelten beim Aufheben. Ein späterer AH-Scan ändert alte Werte nicht.
+Addon for World of Warcraft: Forever (interface 16001). A small window shows the gold and the gold per hour of the running session, split into herbs and loot.
+
+- **Herbs** is loot taken from a world object right after Herb Gathering. Everything else counts as **Loot**.
+- Items count at their Auctionator price, or at the vendor price without Auctionator. Poor-quality and bind-on-pickup items always count at the vendor price, coins from the loot window count directly.
+- Prices are taken when the item is picked up. A later auction house scan does not change old values.
+
+The addon speaks English and German and follows the language of the game client.
 
 ## Installation
 
-Das Zip des [neuesten Release](https://github.com/kejith/GoldPerHour/releases/latest) nach `World of Warcraft\_forever_\Interface\AddOns` entpacken, sodass dort der Ordner `GoldPerHour` liegt. Danach im Spiel `/reload`.
+Unpack the zip of the [latest release](https://github.com/kejith/GoldPerHour/releases/latest) into `World of Warcraft\_forever_\Interface\AddOns`, so that the folder `GoldPerHour` sits there. Then type `/reload` in the game.
 
-Die Desktop-App aus [wow-forever-tools](https://github.com/kejith/wow-forever-tools) installiert und aktualisiert das Addon per Klick und zeigt Sitzungen, Verlauf und Einstellungen.
+The desktop app from [wow-forever-tools](https://github.com/kejith/wow-forever-tools) installs and updates the addon with one click and shows sessions, history and settings.
 
-## Befehle
+## Commands
 
-| Befehl | Wirkung |
+| Command | Effect |
 | --- | --- |
-| `/gph` | Fenster ein- und ausblenden |
-| `/gph start`, `/gph stop` | Sitzung starten, anhalten |
-| `/gph reset` | Sitzung in den Verlauf legen und neu beginnen |
-| `/gph show`, `/gph hide` | Fenster zeigen, verstecken |
-| `/gph herbid <ZauberID>` | weiteren Zauber als Kräutersammeln zählen |
-| `/gph debug` | Diagnosemeldungen im Chat ein- und ausschalten |
+| `/gph` | show or hide the window |
+| `/gph start`, `/gph stop` | start or pause the session |
+| `/gph reset` | move the session to the history and start over |
+| `/gph show`, `/gph hide` | show or hide the window |
+| `/gph herbid <spellID>` | count another spell as herb gathering |
+| `/gph debug` | switch diagnostic chat messages on or off |
 
-Die Sitzung pausiert beim Logout. Nach `/reload` läuft sie weiter, nach einem echten Login nicht.
+The session pauses on logout. After `/reload` it keeps running, after a real login it does not.
 
-## Daten für die Desktop-App
+## Data for the desktop app
 
-Das Addon schreibt nach `GoldPerHourDB` (Account-SavedVariables `GoldPerHour.lua`). WoW schreibt die Datei nur bei `/reload` oder Logout.
+The addon writes to `GoldPerHourDB` (account SavedVariables `GoldPerHour.lua`). The game writes that file only on `/reload` or logout.
 
-- `gold`, `coin`, `items`, `elapsed`: laufende Sitzung
-- `session`: `started`, `lastActive`, `zones`, `chars`, `samples` (Goldkurve, ein Punkt alle 5 Minuten Sitzungszeit)
-- `history`: abgeschlossene Sitzungen, höchstens 100
-- `settings`: `scale`, `tooltipItems`, `priceSource` (`auctionator` oder `vendor`), `resumeAfterReload`, `autoStart`
-- `lastRequest`: Ergebnis des letzten Auftrags
+- `gold`, `coin`, `items`, `elapsed`: the running session
+- `session`: `started`, `lastActive`, `zones`, `chars`, `samples` (gold curve, one point per 5 minutes of session time)
+- `history`: finished sessions, at most 100
+- `settings`: `scale`, `tooltipItems`, `priceSource` (`auctionator` or `vendor`), `resumeAfterReload`, `autoStart`
+- `lastRequest`: result of the last request
 
-Aufträge kommen über `AppRequest.lua` im Addon-Ordner. Die App überschreibt die Datei, das Spiel liest sie beim nächsten `/reload`:
+Requests arrive through `AppRequest.lua` in the addon folder. The app overwrites the file, the game reads it on the next `/reload`:
 
 ```lua
 GoldPerHour_AppRequest = { id = 1, action = "reset", settings = { scale = 1.2, autoStart = true } }
 ```
 
-`action` ist `start`, `stop` oder `reset` und darf fehlen. Jede `id` läuft einmal. Einstellungen prüft das Addon selbst (Skalierung 0,5 bis 2, Tooltip 1 bis 30 Items).
+`action` is `start`, `stop` or `reset` and may be left out. Every `id` runs once. The addon validates the settings itself (scale 0.5 to 2, tooltip 1 to 30 items).
 
-## Entwicklung
+## Development
 
-`tests/test_addon.py` lässt `GoldPerHour.lua` in Lua 5.4 mit nachgebauter WoW-API laufen (Sitzung, Kräuter gegen Loot, `/reload`, Aufträge, Verlauf):
+`tests/test_addon.py` runs the addon in Lua 5.4 against a stubbed WoW API (session, herbs against loot, `/reload`, requests, history, both languages, the `.toc`):
 
 ```
 uv run tests/test_addon.py
 ```
 
-`--dump <Datei>` schreibt den Stand am Ende des Hauptszenarios als SavedVariables-Datei. wow-forever-tools nutzt sie als Testdaten (`scripts/fixtures/goldperhour`).
+`--dump <file>` writes the state at the end of the main scenario as a SavedVariables file. wow-forever-tools uses it as test data (`scripts/fixtures/goldperhour`).
 
-Stand 0.3.0: in der Simulation getestet, im Spiel noch nicht gelaufen.
+Texts live in `Locales.lua`. English is the default; a language only lists what it translates. To add a language, add a block for its `GetLocale()` code.
 
-## Release
+Status of 0.3: tested in the simulation, not yet played in the game.
 
-1. `## Version:` in `GoldPerHour.toc` hochzählen und committen.
-2. `git tag v<Version>` und `git push origin main v<Version>`.
+## Releases
 
-Die GitHub-Action prüft, dass Tag und Version übereinstimmen, lässt die Tests laufen und hängt `GoldPerHour-v<Version>.zip` an das Release. Das Zip enthält nur den Ordner `GoldPerHour` mit den Dateien aus der `.toc`.
+Releases are automatic. Raise `## Version:` in `GoldPerHour.toc` and push to `main`:
+
+1. The CI workflow runs the tests and builds the zip.
+2. If the version has no tag yet, CI creates the tag `v<version>` and starts the release workflow.
+3. The release workflow builds `GoldPerHour-v<version>.zip` with the [BigWigs packager](https://github.com/BigWigsMods/packager), checks it and publishes it as a GitHub release with the commits since the last release as notes.
+
+A tag pushed by hand (`git tag v<version> && git push origin v<version>`) starts the same release workflow. The tag must match the version in the `.toc`. `.pkgmeta` lists what stays out of the zip.
+
+### CurseForge and Wago
+
+The release workflow also uploads to CurseForge and Wago Addons as soon as both the project id and the API token are present. Until then these uploads are skipped.
+
+| Site | One-time setup | Line in `GoldPerHour.toc` | Repository secret |
+| --- | --- | --- | --- |
+| [CurseForge](https://www.curseforge.com/project/create) | create the project for World of Warcraft, pick a license, wait for approval | `## X-Curse-Project-ID: <id>` (the "Project ID" on the project page) | `CF_API_TOKEN` from <https://authors.curseforge.com/#/settings/api-tokens> |
+| [Wago Addons](https://addons.wago.io/developers) | create the project | `## X-Wago-ID: <id>` | `WAGO_API_TOKEN` from <https://addons.wago.io/account/apikeys> |
+
+Set a secret with `gh secret set CF_API_TOKEN --repo kejith/GoldPerHour`. The packager marks the upload as compatible with WoW: Forever from the interface number in the `.toc`. WoWInterface has no category for WoW: Forever.

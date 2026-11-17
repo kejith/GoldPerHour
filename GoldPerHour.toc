@@ -3,11 +3,13 @@
 ## Notes: Gold per hour, split into herbalism and loot
 ## Notes-deDE: Gold pro Stunde, getrennt nach Kräuterkunde und Loot
 ## Author: Kejith
-## Version: 0.3.0
+## Version: 0.3.1
 ## IconTexture: Interface\Icons\INV_Misc_Coin_01
 ## AddonCompartmentFunc: GoldPerHour_OnAddonCompartmentClick
 ## SavedVariables: GoldPerHourDB
 ## OptionalDeps: Auctionator
+## X-Website: https://github.com/kejith/GoldPerHour
 
 AppRequest.lua
+Locales.lua
 GoldPerHour.lua
