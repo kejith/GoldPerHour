@@ -76,20 +76,32 @@ return function(name, v) return name .. " = " .. ser(v, "") .. "\n" end
 """
 
 # Just enough of the client for GoldPerHour.lua: frames swallow every method, events go to the frame of
-# the last load (a /reload re-runs the file against the same GoldPerHourDB).
+# the last load (a /reload re-runs the file against the same GoldPerHourDB). Widgets remember their scripts,
+# texts, bar values, button textures and whether they are enabled, so the tests can read the window.
 STUBS = r"""
 now, money, zone, locale = 100, 10000, "The Barrens", "enUS"
 loot = {}
 tickers = {}
 handler = nil
 local function noop() end
+local function record(field) return function(self, v) rawset(self, field, v) end end
 local frameMeta = { __index = function(t, k)
-  if k == "SetScript" then return function(self, name, fn) if name == "OnEvent" then handler = fn end end end
+  if k == "SetScript" then return function(self, name, fn)
+    if name == "OnEvent" then handler = fn end
+    local scripts = rawget(self, "scripts") or {}
+    scripts[name] = fn
+    rawset(self, "scripts", scripts)
+  end end
+  if k == "SetText" then return record("text") end
+  if k == "SetValue" then return record("value") end
+  if k == "SetNormalTexture" then return record("normal") end
+  if k == "SetEnabled" then return record("enabled") end
   if k == "IsShown" then return function(self) return self.shown ~= false end end
   if k == "SetShown" then return function(self, v) self.shown = v end end
   if k == "SetScale" then return function(self, v) self.scale = v end end
   if k == "GetPoint" then return function() return "CENTER", nil, "CENTER", 0, 0 end end
   if k == "GetBottom" then return function() return 300 end end
+  if k == "GetFrameLevel" then return function() return 1 end end
   if k == "CreateTexture" or k == "CreateFontString" then return function() return setmetatable({}, getmetatable(t)) end end
   return noop
 end }
@@ -282,6 +294,82 @@ def test_locales():
     print("ok test_locales")
 
 
+def test_window_states():
+    lua = new_runtime()
+    ui = load_addon(lua).ui
+    lua.globals().UI = ui
+    lua.execute('fire("PLAYER_ENTERING_WORLD", true, false)')
+
+    def refresh(seconds=0):
+        lua.execute(f"now = now + {seconds}; UI.frame.scripts.OnUpdate(UI.frame, 1)")
+
+    # Not started: a hint instead of the session, nothing to reset, the play button.
+    refresh()
+    assert ui.state == "idle", ui.state
+    assert "Press start to count your gold" in ui.session.text and ui.clock.text == ""
+    assert "--" in ui.perHour.text and ui.perHourLabel.text == "per hour"
+    assert ui.reset.enabled is False and ui.toggle.normal.endswith("NextPage-Up")
+    assert ui.bars.herb.value == 0 and ui.bars.loot.value == 0
+
+    # The play button starts the session; within the first minute the gold per hour waits.
+    lua.execute("UI.toggle.scripts.OnClick(UI.toggle)")
+    mob_loot(lua)
+    refresh(30)
+    assert ui.state == "running" and db(lua)["elapsed"] == 0
+    assert ui.toggle.normal.endswith("PauseButton") and ui.reset.enabled is True
+    assert "--" in ui.perHour.text and ui.perHourLabel.text == "per hour after 1 minute"
+    assert "0:00:30" in ui.clock.text and "3500" in ui.session.text
+    assert ui.bars.loot.value == 1 and ui.bars.loot.amount.text.startswith("3500 ") and "100%" in ui.bars.loot.amount.text
+    assert ui.bars.herb.value == 0 and "-" in ui.bars.herb.amount.text
+
+    # After a minute: 3500 copper in 90 s is 140000 copper per hour.
+    refresh(60)
+    assert ui.perHour.text == "140000" and ui.perHourLabel.text == "per hour", ui.perHour.text
+
+    # Herbs and loot split the bars by their share of the total.
+    lua.execute("""fire("UNIT_SPELLCAST_SENT", "player", nil, nil, 2366)
+      loot = { { link = LINK, qty = 1, guid = "GameObject-0-1-2-3-4-5" } }
+      fire("LOOT_READY"); fire("LOOT_SLOT_CLEARED", 1); loot = {}; fire("LOOT_CLOSED")""")
+    refresh()
+    assert abs(ui.bars.herb.value - 1000 / 4500) < 1e-9 and "22%" in ui.bars.herb.amount.text
+    assert "78%" in ui.bars.loot.amount.text
+
+    # Tooltips of the window, a bar and the buttons build without errors.
+    lua.execute("""UI.frame.scripts.OnEnter(UI.frame, true); UI.bars.herb.scripts.OnEnter(UI.bars.herb, true)
+      UI.toggle.scripts.OnEnter(UI.toggle, true); UI.reset.scripts.OnEnter(UI.reset, true)
+      UI.close.scripts.OnEnter(UI.close, true)""")
+
+    # The pause button stops the clock; the window says so.
+    lua.execute("UI.toggle.scripts.OnClick(UI.toggle)")
+    refresh(100)
+    assert ui.state == "paused" and db(lua)["elapsed"] == 90
+    assert "Paused" in ui.clock.text and "1:30" in ui.clock.text and ui.toggle.normal.endswith("NextPage-Up")
+
+    # Slash commands drive the same window: a reset goes back to idle.
+    lua.globals().SlashCmdList.GOLDPERHOUR("reset")
+    assert ui.state == "idle" and ui.reset.enabled is False and len(values(db(lua)["history"])) == 1
+    lua.globals().SlashCmdList.GOLDPERHOUR("start")
+    assert ui.state == "running"
+
+    # The close button hides the window like /gph hide.
+    lua.execute("UI.close.scripts.OnClick(UI.close)")
+    assert db(lua)["hidden"] is True and ui.frame.shown is False
+
+    # With autoStart the hint says that loot starts the session, in German on a German client.
+    lua = new_runtime("deDE")
+    lua.execute('GoldPerHourDB = { settings = { autoStart = true } }')
+    ui = load_addon(lua).ui
+    lua.globals().UI = ui
+    lua.execute('fire("PLAYER_ENTERING_WORLD", true, false); UI.frame.scripts.OnUpdate(UI.frame, 1)')
+    assert "Etwas looten oder Start drücken" in ui.session.text, ui.session.text
+    mob_loot(lua, qty=1, coins=0)
+    lua.execute("UI.frame.scripts.OnUpdate(UI.frame, 1)")
+    assert ui.state == "running" and "Sitzung" in ui.session.text
+    lua.execute("UI.toggle.scripts.OnClick(UI.toggle); UI.frame.scripts.OnUpdate(UI.frame, 1)")
+    assert "Pausiert" in ui.clock.text
+    print("ok test_window_states")
+
+
 def test_toc():
     fields, files = toc()
     assert fields["Interface"] == "16001" and re.fullmatch(r"\d+\.\d+\.\d+", fields["Version"]), fields
@@ -299,6 +387,7 @@ if __name__ == "__main__":
     test_herb_gathering()
     test_login_does_not_resume()
     test_locales()
+    test_window_states()
     test_toc()
     if "--dump" in sys.argv:
         target = sys.argv[sys.argv.index("--dump") + 1]

@@ -24,7 +24,6 @@ local ICON = {
     addon = "Interface\\Icons\\INV_Misc_Coin_01",
     [HERB] = "Interface\\Icons\\Trade_Herbalism",
     [LOOT] = "Interface\\Icons\\INV_Misc_Bag_08",
-    total = "Interface\\Icons\\INV_Misc_Coin_02",
 }
 
 local L = ns.L
@@ -142,91 +141,159 @@ local function ItemValue(link)
 end
 
 ---------------------------------------------------------------------------
--- Window
+-- Window: a compact meter in the style of Details!. A slim title bar with the controls, the gold per hour
+-- as the big number, the session below it and one bar per category whose fill is its share of the total.
 ---------------------------------------------------------------------------
-local WIDTH, PAD, COLUMN = 260, 8, 86
+local WIDTH, HEIGHT, PAD = 240, 113, 8
+local TITLE_HEIGHT, BAR_HEIGHT, BAR_GAP = 20, 18, 2
+local WARMUP = 60 -- seconds of session time before the gold per hour is shown; earlier it is mostly noise
 
-local frame = CreateFrame("Frame", "GoldPerHourFrame", UIParent, "BackdropTemplate")
-frame:SetSize(WIDTH, 136)
+-- Textures the client's own interface uses: the stopwatch (Blizzard_TimeManager) has the same play, pause
+-- and reset buttons; the bar texture is the classic status bar.
+local TEXTURE = {
+    bar = "Interface\\TargetingFrame\\UI-StatusBar",
+    play = "Interface\\Buttons\\UI-SpellbookIcon-NextPage-Up",
+    pause = "Interface\\TimeManager\\PauseButton",
+    reset = "Interface\\TimeManager\\ResetButton",
+    highlight = "Interface\\Buttons\\UI-Common-MouseHilight",
+}
+local BAR_COLOR = { [HERB] = { 0.18, 0.60, 0.22 }, [LOOT] = { 0.78, 0.55, 0.15 } }
+local GREY, GREEN, YELLOW = "|cff9d9d9d%s|r", "|cff4ce64c%s|r", "|cffffd100%s|r"
+
+-- The border of the modern tooltips (NineSlice layout "TooltipDefaultLayout" of SharedXML); the classic
+-- tooltip backdrop is the fallback for a client without it.
+local modernBorder = TooltipBackdropTemplateMixin ~= nil
+local frame = CreateFrame("Frame", "GoldPerHourFrame", UIParent,
+    modernBorder and "TooltipBackdropTemplate" or "BackdropTemplate")
+frame:SetSize(WIDTH, HEIGHT)
 frame:SetClampedToScreen(true)
 frame:SetMovable(true)
 frame:EnableMouse(true)
 frame:RegisterForDrag("LeftButton")
-frame:SetBackdrop({
-    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    edgeSize = 12, insets = { left = 3, right = 3, top = 3, bottom = 3 },
-})
-frame:SetBackdropColor(0, 0, 0, 0.85)
+if not modernBorder and frame.SetBackdrop then
+    frame:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        edgeSize = 12, insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+end
+if frame.SetBackdropColor then frame:SetBackdropColor(0.03, 0.03, 0.03, 0.88) end
 
-local titleIcon = frame:CreateTexture(nil, "ARTWORK")
-titleIcon:SetSize(16, 16)
-titleIcon:SetPoint("TOPLEFT", PAD, -7)
+-- Title bar: a darker strip with a thin gold line below it.
+local titleBar = frame:CreateTexture(nil, "ARTWORK", nil, -2)
+titleBar:SetPoint("TOPLEFT", 3, -3)
+titleBar:SetPoint("TOPRIGHT", -3, -3)
+titleBar:SetHeight(TITLE_HEIGHT)
+titleBar:SetColorTexture(0, 0, 0, 0.45)
+
+local titleLine = frame:CreateTexture(nil, "ARTWORK", nil, -1)
+titleLine:SetPoint("TOPLEFT", titleBar, "BOTTOMLEFT")
+titleLine:SetPoint("TOPRIGHT", titleBar, "BOTTOMRIGHT")
+titleLine:SetHeight(1)
+titleLine:SetColorTexture(1, 0.82, 0, 0.25)
+
+local titleIcon = frame:CreateTexture(nil, "OVERLAY")
+titleIcon:SetSize(14, 14)
+titleIcon:SetPoint("LEFT", titleBar, "LEFT", 4, 0)
 titleIcon:SetTexture(ICON.addon)
-
-local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-title:SetPoint("LEFT", titleIcon, "RIGHT", 5, 0)
-title:SetText("GoldPerHour")
+titleIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
 local closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-closeButton:SetSize(22, 22)
-closeButton:SetPoint("TOPRIGHT", -2, -2)
+closeButton:SetSize(18, 18)
+closeButton:SetPoint("RIGHT", titleBar, "RIGHT", -1, 0)
+-- The template puts the button at frame level 510, meant for panels; keep it with this small window.
+closeButton:SetFrameLevel(frame:GetFrameLevel() + 2)
 
-local timeText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-timeText:SetPoint("RIGHT", closeButton, "LEFT", -2, 0)
-
-local function RightAligned(font, x, y, text)
-    local fs = frame:CreateFontString(nil, "OVERLAY", font)
-    fs:SetPoint("RIGHT", frame, "TOPRIGHT", x, y)
-    fs:SetJustifyH("RIGHT")
-    if text then fs:SetText(text) end
-    return fs
+local function IconButton(texture)
+    local button = CreateFrame("Button", nil, frame)
+    button:SetSize(18, 18)
+    button:SetNormalTexture(texture)
+    button:SetDisabledTexture(texture)
+    button:SetHighlightTexture(TEXTURE.highlight, "ADD")
+    button:SetMotionScriptsWhileDisabled(true)
+    local disabled = button.GetDisabledTexture and button:GetDisabledTexture()
+    if disabled then
+        disabled:SetDesaturated(true)
+        disabled:SetAlpha(0.35)
+    end
+    return button
 end
 
-RightAligned("GameFontDisableSmall", -PAD - COLUMN - 6, -34, L.gold)
-RightAligned("GameFontDisableSmall", -PAD, -34, L.perHour)
+local resetButton = IconButton(TEXTURE.reset)
+resetButton:SetPoint("RIGHT", closeButton, "LEFT", -1, 0)
+local toggleButton = IconButton(TEXTURE.play)
+toggleButton:SetPoint("RIGHT", resetButton, "LEFT", 0, 0)
 
-local function MakeRow(key, y, font)
-    local icon = frame:CreateTexture(nil, "ARTWORK")
-    icon:SetSize(14, 14)
-    icon:SetPoint("TOPLEFT", PAD, y)
-    icon:SetTexture(ICON[key])
+local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+title:SetPoint("LEFT", titleIcon, "RIGHT", 4, 0)
+title:SetPoint("RIGHT", toggleButton, "LEFT", -4, 0)
+title:SetJustifyH("LEFT")
+title:SetWordWrap(false)
+title:SetText(L.title)
+
+-- The big number: gold per hour of both categories together.
+local perHourText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+perHourText:SetPoint("TOPLEFT", PAD, -(TITLE_HEIGHT + 11))
+perHourText:SetJustifyH("LEFT")
+local perHourLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+perHourLabel:SetPoint("BOTTOMLEFT", perHourText, "BOTTOMRIGHT", 5, 1)
+
+-- Below it: the session gold on the left, the clock (or the state) on the right.
+local sessionText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+sessionText:SetPoint("TOPLEFT", PAD, -(TITLE_HEIGHT + 31))
+sessionText:SetJustifyH("LEFT")
+local clockText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+clockText:SetPoint("TOPRIGHT", -PAD, -(TITLE_HEIGHT + 31))
+clockText:SetJustifyH("RIGHT")
+
+-- One bar per category, like a row of a damage meter: icon, name, gold and share.
+local bars = {}
+for i, category in ipairs(CATEGORIES) do
+    local y = -(TITLE_HEIGHT + 47) - (i - 1) * (BAR_HEIGHT + BAR_GAP)
+    local bar = CreateFrame("StatusBar", nil, frame)
+    bar:SetPoint("TOPLEFT", PAD, y)
+    bar:SetPoint("TOPRIGHT", -PAD, y)
+    bar:SetHeight(BAR_HEIGHT)
+    bar:SetStatusBarTexture(TEXTURE.bar)
+    local color = BAR_COLOR[category]
+    bar:SetStatusBarColor(color[1], color[2], color[3], 0.9)
+    bar:SetMinMaxValues(0, 1)
+    bar:SetValue(0)
+    bar:EnableMouse(true)
+    bar:RegisterForDrag("LeftButton")
+    bar.category = category
+
+    local background = bar:CreateTexture(nil, "BACKGROUND")
+    background:SetAllPoints()
+    background:SetColorTexture(1, 1, 1, 0.06)
+
+    local icon = bar:CreateTexture(nil, "OVERLAY")
+    icon:SetSize(BAR_HEIGHT, BAR_HEIGHT)
+    icon:SetPoint("LEFT")
+    icon:SetTexture(ICON[category])
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-    local label = frame:CreateFontString(nil, "OVERLAY", font)
-    label:SetPoint("LEFT", icon, "RIGHT", 4, 0)
-    label:SetText(L[key])
+    local name = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    name:SetPoint("LEFT", icon, "RIGHT", 4, 0)
+    name:SetText(L[category])
 
-    return {
-        total = RightAligned(font, -PAD - COLUMN - 6, y - 7),
-        perHour = RightAligned(font, -PAD, y - 7),
-    }
+    bar.amount = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    bar.amount:SetPoint("RIGHT", -4, 0)
+    bar.amount:SetJustifyH("RIGHT")
+
+    bars[category] = bar
 end
 
-local rows = {
-    [HERB] = MakeRow(HERB, -44, "GameFontHighlightSmall"),
-    [LOOT] = MakeRow(LOOT, -61, "GameFontHighlightSmall"),
-    total = MakeRow("total", -83, "GameFontNormalSmall"),
-}
-
-local separator = frame:CreateTexture(nil, "ARTWORK")
-separator:SetColorTexture(1, 1, 1, 0.15)
-separator:SetHeight(1)
-separator:SetPoint("TOPLEFT", PAD, -79)
-separator:SetPoint("TOPRIGHT", -PAD, -79)
-
-local buttonWidth = (WIDTH - 2 * PAD - 6) / 2
-local toggleButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-toggleButton:SetSize(buttonWidth, 22)
-toggleButton:SetPoint("BOTTOMLEFT", PAD, PAD)
-local resetButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-resetButton:SetSize(buttonWidth, 22)
-resetButton:SetPoint("BOTTOMRIGHT", -PAD, PAD)
-resetButton:SetText(L.reset)
+-- The widgets for the tests (tests/test_addon.py reads what the stub recorded).
+ns.ui = { frame = frame, perHour = perHourText, perHourLabel = perHourLabel, session = sessionText,
+    clock = clockText, bars = bars, toggle = toggleButton, reset = resetButton, close = closeButton }
 
 ---------------------------------------------------------------------------
 -- Tooltip
 ---------------------------------------------------------------------------
+-- Who owns the item tooltip: the window (both categories) or a bar (its category only).
+local tooltip = { owner = nil, category = nil }
+
 local function SortedItems(category)
     local list = {}
     for _, entry in pairs(db.items[category]) do
@@ -269,7 +336,7 @@ local function FillTooltip()
     GameTooltip:AddDoubleLine(L.session, ("%s (%s)"):format(Clock(Elapsed()), running and L.running or L.paused),
         1, 1, 1, 1, 1, 1)
     for _, category in ipairs(CATEGORIES) do
-        AddCategory(category)
+        if not tooltip.category or tooltip.category == category then AddCategory(category) end
     end
     GameTooltip:AddLine(" ")
     if Setting("priceSource") == "vendor" then
@@ -283,8 +350,10 @@ local function FillTooltip()
     GameTooltip:Show()
 end
 
-local function ShowTooltip()
-    GameTooltip:SetOwner(frame, "ANCHOR_NONE")
+-- The item tooltip sits below the window, or above it when the window is near the bottom of the screen.
+local function ShowTooltip(owner, category)
+    tooltip.owner, tooltip.category = owner, category
+    GameTooltip:SetOwner(owner, "ANCHOR_NONE")
     if (frame:GetBottom() or 0) > 260 then
         GameTooltip:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", 0, -2)
     else
@@ -293,30 +362,80 @@ local function ShowTooltip()
     FillTooltip()
 end
 
+-- A button's tooltip: what it does in white and gold, the slash command in grey.
+local function ButtonTooltip(button, heading, text, command)
+    tooltip.owner, tooltip.category = nil, nil
+    GameTooltip:SetOwner(button, "ANCHOR_TOP")
+    GameTooltip:SetText(heading, 1, 1, 1)
+    GameTooltip:AddLine(text, 1, 0.82, 0, true)
+    if command then GameTooltip:AddLine(command, 0.6, 0.6, 0.6) end
+    GameTooltip:Show()
+end
+
+local function ToggleTooltip(button)
+    if running then
+        ButtonTooltip(button, L.pause, L.pauseTip, "/gph stop")
+    else
+        ButtonTooltip(button, db.elapsed > 0 and L.resume or L.start, L.startTip, "/gph start")
+    end
+end
+
 ---------------------------------------------------------------------------
 -- Display
 ---------------------------------------------------------------------------
-local function SetRow(row, copper)
-    row.total:SetText(Money(copper))
-    row.perHour:SetText(Money(PerHour(copper)))
+local function HasSession()
+    return running or db.elapsed > 0 or db.gold[HERB] + db.gold[LOOT] > 0
+end
+
+-- "running" (the clock ticks), "paused" (a session with time or gold that is stopped) or "idle" (nothing yet).
+local function State()
+    if running then return "running" end
+    return HasSession() and "paused" or "idle"
 end
 
 local function Refresh()
     if not db then return end
-    local herb, other = db.gold[HERB], db.gold[LOOT]
-    SetRow(rows[HERB], herb)
-    SetRow(rows[LOOT], other)
-    SetRow(rows.total, herb + other)
+    local total = db.gold[HERB] + db.gold[LOOT]
+    local elapsed = Elapsed()
+    local state = State()
+    ns.ui.state = state
 
-    timeText:SetText(Clock(Elapsed()))
-    if running then
-        timeText:SetTextColor(0.3, 1, 0.3)
+    if elapsed >= WARMUP then
+        perHourText:SetText(Money(PerHour(total)))
+        perHourLabel:SetText(L.perHour)
     else
-        timeText:SetTextColor(0.6, 0.6, 0.6)
+        perHourText:SetText(GREY:format("--"))
+        perHourLabel:SetText(state == "idle" and L.perHour or L.warmup)
     end
-    toggleButton:SetText(running and L.stop or (db.elapsed > 0 and L.resume or L.start))
 
-    if GameTooltip:IsOwned(frame) then FillTooltip() end
+    if state == "idle" then
+        sessionText:SetText(GREY:format(Setting("autoStart") and L.idleAuto or L.idle))
+        clockText:SetText("")
+    else
+        sessionText:SetText(GREY:format(L.session) .. " " .. Money(total))
+        if state == "running" then
+            clockText:SetText(GREEN:format(Clock(elapsed)))
+        else
+            clockText:SetText(YELLOW:format(L.statusPaused) .. "  " .. GREY:format(Clock(elapsed)))
+        end
+    end
+
+    for _, category in ipairs(CATEGORIES) do
+        local bar, gold = bars[category], db.gold[category]
+        local share = total > 0 and gold / total or 0
+        bar:SetValue(share)
+        if gold > 0 then
+            bar.amount:SetText(Money(gold) .. " " .. GREY:format(("%d%%"):format(math.floor(share * 100 + 0.5))))
+        else
+            bar.amount:SetText(GREY:format("-"))
+        end
+    end
+
+    toggleButton:SetNormalTexture(running and TEXTURE.pause or TEXTURE.play)
+    resetButton:SetEnabled(HasSession())
+    titleIcon:SetDesaturated(not running)
+
+    if tooltip.owner and GameTooltip:IsOwned(tooltip.owner) then FillTooltip() end
 end
 
 local function SetVisible(shown)
@@ -634,16 +753,36 @@ end
 ---------------------------------------------------------------------------
 -- Interaction
 ---------------------------------------------------------------------------
-frame:SetScript("OnDragStart", frame.StartMoving)
-frame:SetScript("OnDragStop", function(self)
-    self:StopMovingOrSizing()
-    local point, _, relativePoint, x, y = self:GetPoint()
+local function StartMoving()
+    frame:StartMoving()
+end
+
+local function StopMoving()
+    frame:StopMovingOrSizing()
+    local point, _, relativePoint, x, y = frame:GetPoint()
     db.pos = { point, relativePoint, x, y }
-end)
-frame:SetScript("OnEnter", ShowTooltip)
-frame:SetScript("OnLeave", function()
+end
+
+local function HideTooltip()
     GameTooltip:Hide()
+end
+
+frame:SetScript("OnDragStart", StartMoving)
+frame:SetScript("OnDragStop", StopMoving)
+frame:SetScript("OnEnter", function(self)
+    ShowTooltip(self)
 end)
+frame:SetScript("OnLeave", HideTooltip)
+
+-- A bar shows the items of its category; dragging it moves the window.
+for _, bar in pairs(bars) do
+    bar:SetScript("OnDragStart", StartMoving)
+    bar:SetScript("OnDragStop", StopMoving)
+    bar:SetScript("OnEnter", function(self)
+        ShowTooltip(self, self.category)
+    end)
+    bar:SetScript("OnLeave", HideTooltip)
+end
 
 local sinceRefresh = 0
 frame:SetScript("OnUpdate", function(_, dt)
@@ -663,16 +802,30 @@ C_Timer.NewTicker(5, function()
 end)
 
 closeButton:SetScript("OnClick", function()
+    GameTooltip:Hide()
     SetVisible(false)
 end)
-toggleButton:SetScript("OnClick", function()
-    if running then Stop() else Start() end
+closeButton:SetScript("OnEnter", function(self)
+    ButtonTooltip(self, L.close, L.closeTip, "/gph hide")
 end)
+closeButton:SetScript("OnLeave", HideTooltip)
+
+toggleButton:SetScript("OnClick", function(self)
+    if running then Stop() else Start() end
+    if GameTooltip:IsOwned(self) then ToggleTooltip(self) end
+end)
+toggleButton:SetScript("OnEnter", ToggleTooltip)
+toggleButton:SetScript("OnLeave", HideTooltip)
+
 resetButton:SetScript("OnClick", function()
     if Elapsed() > 0 or db.gold[HERB] + db.gold[LOOT] > 0 then
         StaticPopup_Show("GOLDPERHOUR_RESET")
     end
 end)
+resetButton:SetScript("OnEnter", function(self)
+    ButtonTooltip(self, L.reset, L.resetTip, "/gph reset")
+end)
+resetButton:SetScript("OnLeave", HideTooltip)
 
 function GoldPerHour_OnAddonCompartmentClick()
     SetVisible(not frame:IsShown())
