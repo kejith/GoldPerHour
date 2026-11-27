@@ -1,9 +1,9 @@
 ## Interface: 16001
 ## Title: GoldPerHour
-## Notes: Gold per hour, split into herbalism and loot
-## Notes-deDE: Gold pro Stunde, getrennt nach Kräuterkunde und Loot
+## Notes: Gold per hour, always-on loot history, auction house and account wealth tracker
+## Notes-deDE: Gold pro Stunde, permanente Loot-Historie, Auktionshaus- und Vermögens-Tracker
 ## Author: Kejith
-## Version: 0.4.0
+## Version: 0.5.0
 ## IconTexture: Interface\Icons\INV_Misc_Coin_01
 ## AddonCompartmentFunc: GoldPerHour_OnAddonCompartmentClick
 ## SavedVariables: GoldPerHourDB
@@ -12,4 +12,8 @@
 
 AppRequest.lua
 Locales.lua
+Valuation.lua
+Wealth.lua
+Ledger.lua
+StatsFrame.lua
 GoldPerHour.lua

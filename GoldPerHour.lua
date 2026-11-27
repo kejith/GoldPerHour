@@ -1,29 +1,46 @@
 local ADDON, ns = ...
 
-local HERB, LOOT = "herb", "loot"
-local CATEGORIES = { HERB, LOOT }
+local HERB, MINING, SKINNING, FISHING, LOOT, DUNGEON = "herb", "mining", "skinning", "fishing", "loot", "dungeon"
+local CATEGORIES = { HERB, MINING, SKINNING, FISHING, LOOT, DUNGEON }
+local DEFAULT_BARS = { HERB, LOOT }
+ns.CATEGORIES = CATEGORIES
 
-local CAST_WINDOW = 15      -- seconds between the gathering cast and its loot
-local MONEY_GRACE = 1.5     -- seconds after LOOT_CLOSED in which PLAYER_MONEY still counts as loot
-local HERB_GATHERING = 2366 -- Herb Gathering; add other spells with /gph herbid <id>
-local SAMPLE_EVERY = 300    -- seconds of session time between two points of the gold curve
-local MAX_SAMPLES = 288     -- 24 h at 5 min; above that every second point is dropped
-local MAX_HISTORY = 100     -- finished sessions kept for the desktop app
+local CAST_WINDOW = 15        -- seconds between a gathering cast and its loot
+local MONEY_GRACE = 1.5       -- seconds after LOOT_CLOSED in which PLAYER_MONEY still counts as loot
+local HERB_GATHERING = 2366   -- Herb Gathering; add other spells with /gph herbid <id>
+local MINING_SPELLS = { [2575] = true, [2576] = true, [3564] = true, [10248] = true, [29354] = true, [32606] = true, [50310] = true }
+local MINING_BASE = 2575
+local SKINNING_BASE = 8613
+local FISHING_BASE = 7620
+local SAMPLE_EVERY = 300      -- seconds of session time between two points of the gold curve
+local MAX_SAMPLES = 288       -- 24 h at 5 min; above that every second point is dropped
+local MAX_HISTORY = 100       -- finished sessions kept for the desktop app
 
--- Settings the desktop app can change through AppRequest.lua (window visibility and herb spells live in
--- db.hidden and db.herbSpells, as before 0.3).
+-- Settings the desktop app can change through AppRequest.lua (window visibility and custom spells live in
+-- db.hidden, db.herbSpells and db.miningSpells).
 local DEFAULTS = {
-    scale = 1,                 -- window scale
-    tooltipItems = 6,          -- items listed per category in the tooltip
-    priceSource = "auctionator", -- "auctionator" (vendor price as fallback) or "vendor"
-    resumeAfterReload = true,  -- a running session keeps running across /reload
-    autoStart = false,         -- the first loot window starts a stopped session
+    scale = 1,                    -- window scale
+    tooltipItems = 6,             -- items listed per category in the tooltip
+    priceSource = "auctionator",  -- "auctionator" (vendor price as fallback) or "vendor"
+    resumeAfterReload = true,     -- a running session keeps running across /reload
+    autoStart = false,            -- the first loot window starts a stopped session
+    deductAhCut = true,           -- deduct 5% auction house cut from Auctionator prices
+    vendorFloor = true,           -- always use vendor price if it beats effective AH price
+    ahMinValue = 0,               -- optional copper floor for BoE weapons/armor (0 = disabled)
+    wealthInterval = 300,         -- seconds between periodic wealth snapshots
+    minDropQuality = 3,           -- minimum quality (3 = Rare) recorded in top drops
+    minDropValue = 50000,         -- minimum copper value (5g) recorded in top drops
+    trackAlways = true,           -- always record loot, cashflow, AH & runs in the background
 }
 
 local ICON = {
     addon = "Interface\\Icons\\INV_Misc_Coin_01",
     [HERB] = "Interface\\Icons\\Trade_Herbalism",
+    [MINING] = "Interface\\Icons\\Trade_Mining",
+    [SKINNING] = "Interface\\Icons\\INV_Misc_Pelt_Wolf_01",
+    [FISHING] = "Interface\\Icons\\Trade_Fishing",
     [LOOT] = "Interface\\Icons\\INV_Misc_Bag_08",
+    [DUNGEON] = "Interface\\Icons\\INV_Misc_Coin_02",
 }
 
 local L = ns.L
@@ -32,7 +49,7 @@ local db
 local running, startedAt = false, 0
 local debug = false
 local lastMoney
-local lastCast = { at = 0, herb = false }
+local lastCast = { at = 0, kind = nil }
 local loot = { open = false, category = nil, moneyUntil = 0, slots = {} }
 
 local SLOT_ITEM = Enum.LootSlotType and Enum.LootSlotType.Item or 1
@@ -41,9 +58,8 @@ local function Print(...)
     print("|cffffd100GoldPerHour:|r", ...)
 end
 
--- Midnight hands some values to addons as opaque "secrets"; never compare those.
 local function IsSecret(value)
-    return issecretvalue ~= nil and issecretvalue(value)
+    return ns.IsSecret(value)
 end
 
 local function Elapsed()
@@ -55,6 +71,15 @@ local function Setting(key)
     if value == nil then return DEFAULTS[key] end
     return value
 end
+ns.Setting = Setting
+
+local function TotalGold()
+    local sum = 0
+    for _, category in ipairs(CATEGORIES) do
+        sum = sum + (db.gold[category] or 0)
+    end
+    return sum
+end
 
 -- Metadata of the running session for the app: wall-clock start, zones, characters and the gold curve.
 local function NewSession()
@@ -64,7 +89,14 @@ end
 local function Sample()
     local s = db.session.samples
     local t = math.floor(Elapsed())
-    local point = { t, math.floor(db.gold[HERB] + 0.5), math.floor(db.gold[LOOT] + 0.5) }
+    local gather = (db.gold[MINING] or 0) + (db.gold[SKINNING] or 0) + (db.gold[FISHING] or 0)
+    local point = {
+        t,
+        math.floor((db.gold[HERB] or 0) + 0.5),
+        math.floor((db.gold[LOOT] or 0) + 0.5),
+        math.floor(gather + 0.5),
+        math.floor((db.gold[DUNGEON] or 0) + 0.5),
+    }
     if s[#s] and s[#s][1] == t then
         s[#s] = point
     else
@@ -84,6 +116,7 @@ local function Where()
     if not zone or zone == "" or IsSecret(zone) then zone = "?" end
     return zone, (UnitName("player"))
 end
+ns.Where = Where
 
 local function Attribute(zone, char, copper)
     db.session.zones[zone] = (db.session.zones[zone] or 0) + copper
@@ -95,12 +128,13 @@ end
 -- Formatting
 ---------------------------------------------------------------------------
 local function Money(copper)
-    copper = math.floor(copper + 0.5)
+    copper = math.floor((copper or 0) + 0.5)
     if copper >= 10000 then
         copper = copper - copper % 100 -- copper is noise once gold is involved
     end
     return GetMoneyString(copper, true)
 end
+ns.Money = Money
 
 local function PerHour(copper)
     local elapsed = Elapsed()
@@ -118,54 +152,36 @@ local function IconText(texture)
 end
 
 ---------------------------------------------------------------------------
--- Prices
+-- Window: a compact meter in the style of Details!. A slim title bar with controls, gold per hour as
+-- the big number, session total below it, and dynamic bars for active categories.
 ---------------------------------------------------------------------------
-local function AuctionatorAPI()
-    return Auctionator and Auctionator.API and Auctionator.API.v1
-end
-
-local function AuctionPrice(link)
-    local api = AuctionatorAPI()
-    if not api then return nil end
-    local ok, price = pcall(api.GetAuctionPriceByItemLink, ADDON, link)
-    if ok and type(price) == "number" and price > 0 then return price end
-end
-
--- Only call once the item data is loaded. Returns the value of one item and its quality.
-local function ItemValue(link)
-    local _, _, quality, _, _, _, _, _, _, _, sellPrice, _, _, bindType = C_Item.GetItemInfo(link)
-    sellPrice = sellPrice or 0
-    -- Poor quality (0) and bind-on-pickup (1) cannot be auctioned.
-    if quality == 0 or bindType == 1 or Setting("priceSource") == "vendor" then return sellPrice, quality end
-    return AuctionPrice(link) or sellPrice, quality
-end
-
----------------------------------------------------------------------------
--- Window: a compact meter in the style of Details!. A slim title bar with the controls, the gold per hour
--- as the big number, the session below it and one bar per category whose fill is its share of the total.
----------------------------------------------------------------------------
-local WIDTH, HEIGHT, PAD = 240, 113, 8
-local TITLE_HEIGHT, BAR_HEIGHT, BAR_GAP = 20, 18, 2
+local WIDTH, PAD = 240, 8
+local TITLE_HEIGHT, BAR_HEIGHT, BAR_GAP, FOOTER_HEIGHT = 20, 18, 2, 18
+local BASE_HEIGHT = TITLE_HEIGHT + 47 + FOOTER_HEIGHT + PAD + 4 -- height above bars + footer + bottom padding
 local WARMUP = 60 -- seconds of session time before the gold per hour is shown; earlier it is mostly noise
 
--- Textures the client's own interface uses: the stopwatch (Blizzard_TimeManager) has the same play, pause
--- and reset buttons; the bar texture is the classic status bar.
 local TEXTURE = {
     bar = "Interface\\TargetingFrame\\UI-StatusBar",
     play = "Interface\\Buttons\\UI-SpellbookIcon-NextPage-Up",
     pause = "Interface\\TimeManager\\PauseButton",
     reset = "Interface\\TimeManager\\ResetButton",
+    stats = "Interface\\Buttons\\UI-GuildButton-PublicNote-Up",
     highlight = "Interface\\Buttons\\UI-Common-MouseHilight",
 }
-local BAR_COLOR = { [HERB] = { 0.18, 0.60, 0.22 }, [LOOT] = { 0.78, 0.55, 0.15 } }
-local GREY, GREEN, YELLOW = "|cff9d9d9d%s|r", "|cff4ce64c%s|r", "|cffffd100%s|r"
+local BAR_COLOR = {
+    [HERB] = { 0.18, 0.60, 0.22 },
+    [MINING] = { 0.72, 0.42, 0.20 },
+    [SKINNING] = { 0.68, 0.52, 0.30 },
+    [FISHING] = { 0.20, 0.54, 0.78 },
+    [LOOT] = { 0.78, 0.55, 0.15 },
+    [DUNGEON] = { 0.52, 0.38, 0.78 },
+}
+local GREY, GREEN, YELLOW, RED = "|cff9d9d9d%s|r", "|cff4ce64c%s|r", "|cffffd100%s|r", "|cfff05454%s|r"
 
--- The border of the modern tooltips (NineSlice layout "TooltipDefaultLayout" of SharedXML); the classic
--- tooltip backdrop is the fallback for a client without it.
 local modernBorder = TooltipBackdropTemplateMixin ~= nil
 local frame = CreateFrame("Frame", "GoldPerHourFrame", UIParent,
     modernBorder and "TooltipBackdropTemplate" or "BackdropTemplate")
-frame:SetSize(WIDTH, HEIGHT)
+frame:SetSize(WIDTH, BASE_HEIGHT + #DEFAULT_BARS * (BAR_HEIGHT + BAR_GAP))
 frame:SetClampedToScreen(true)
 frame:SetMovable(true)
 frame:EnableMouse(true)
@@ -179,7 +195,6 @@ if not modernBorder and frame.SetBackdrop then
 end
 if frame.SetBackdropColor then frame:SetBackdropColor(0.03, 0.03, 0.03, 0.88) end
 
--- Title bar: a darker strip with a thin gold line below it.
 local titleBar = frame:CreateTexture(nil, "ARTWORK", nil, -2)
 titleBar:SetPoint("TOPLEFT", 3, -3)
 titleBar:SetPoint("TOPRIGHT", -3, -3)
@@ -201,7 +216,6 @@ titleIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 local closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
 closeButton:SetSize(18, 18)
 closeButton:SetPoint("RIGHT", titleBar, "RIGHT", -1, 0)
--- The template puts the button at frame level 510, meant for panels; keep it with this small window.
 closeButton:SetFrameLevel(frame:GetFrameLevel() + 2)
 
 local function IconButton(texture)
@@ -223,22 +237,23 @@ local resetButton = IconButton(TEXTURE.reset)
 resetButton:SetPoint("RIGHT", closeButton, "LEFT", -1, 0)
 local toggleButton = IconButton(TEXTURE.play)
 toggleButton:SetPoint("RIGHT", resetButton, "LEFT", 0, 0)
+local statsButton = IconButton(TEXTURE.stats)
+statsButton:SetSize(15, 15)
+statsButton:SetPoint("RIGHT", toggleButton, "LEFT", -2, 0)
 
 local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 title:SetPoint("LEFT", titleIcon, "RIGHT", 4, 0)
-title:SetPoint("RIGHT", toggleButton, "LEFT", -4, 0)
+title:SetPoint("RIGHT", statsButton, "LEFT", -4, 0)
 title:SetJustifyH("LEFT")
 title:SetWordWrap(false)
 title:SetText(L.title)
 
--- The big number: gold per hour of both categories together.
 local perHourText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
 perHourText:SetPoint("TOPLEFT", PAD, -(TITLE_HEIGHT + 11))
 perHourText:SetJustifyH("LEFT")
 local perHourLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 perHourLabel:SetPoint("BOTTOMLEFT", perHourText, "BOTTOMRIGHT", 5, 1)
 
--- Below it: the session gold on the left, the clock (or the state) on the right.
 local sessionText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 sessionText:SetPoint("TOPLEFT", PAD, -(TITLE_HEIGHT + 31))
 sessionText:SetJustifyH("LEFT")
@@ -246,13 +261,10 @@ local clockText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall
 clockText:SetPoint("TOPRIGHT", -PAD, -(TITLE_HEIGHT + 31))
 clockText:SetJustifyH("RIGHT")
 
--- One bar per category, like a row of a damage meter: icon, name, gold and share.
+-- One status bar per category, laid out dynamically depending on which categories have gold > 0.
 local bars = {}
-for i, category in ipairs(CATEGORIES) do
-    local y = -(TITLE_HEIGHT + 47) - (i - 1) * (BAR_HEIGHT + BAR_GAP)
+for _, category in ipairs(CATEGORIES) do
     local bar = CreateFrame("StatusBar", nil, frame)
-    bar:SetPoint("TOPLEFT", PAD, y)
-    bar:SetPoint("TOPRIGHT", -PAD, y)
     bar:SetHeight(BAR_HEIGHT)
     bar:SetStatusBarTexture(TEXTURE.bar)
     local color = BAR_COLOR[category]
@@ -284,31 +296,47 @@ for i, category in ipairs(CATEGORIES) do
     bars[category] = bar
 end
 
--- The widgets for the tests (tests/test_addon.py reads what the stub recorded).
-ns.ui = { frame = frame, perHour = perHourText, perHourLabel = perHourLabel, session = sessionText,
-    clock = clockText, bars = bars, toggle = toggleButton, reset = resetButton, close = closeButton }
+-- Subtle footer strip at the bottom of the compact meter: Today loot on the left, Account wealth on the right.
+local footerLine = frame:CreateTexture(nil, "ARTWORK")
+footerLine:SetPoint("BOTTOMLEFT", PAD, FOOTER_HEIGHT + 4)
+footerLine:SetPoint("BOTTOMRIGHT", -PAD, FOOTER_HEIGHT + 4)
+footerLine:SetHeight(1)
+footerLine:SetColorTexture(1, 0.82, 0, 0.18)
+
+local footerLeft = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+footerLeft:SetPoint("BOTTOMLEFT", PAD, 5)
+footerLeft:SetJustifyH("LEFT")
+
+local footerRight = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+footerRight:SetPoint("BOTTOMRIGHT", -PAD, 5)
+footerRight:SetJustifyH("RIGHT")
+
+ns.ui = {
+    frame = frame, perHour = perHourText, perHourLabel = perHourLabel, session = sessionText,
+    clock = clockText, bars = bars, toggle = toggleButton, reset = resetButton,
+    close = closeButton, stats = statsButton, footerLeft = footerLeft, footerRight = footerRight,
+}
 
 ---------------------------------------------------------------------------
 -- Tooltip
 ---------------------------------------------------------------------------
--- Who owns the item tooltip: the window (both categories) or a bar (its category only).
 local tooltip = { owner = nil, category = nil }
 
 local function SortedItems(category)
     local list = {}
-    for _, entry in pairs(db.items[category]) do
+    for _, entry in pairs(db.items[category] or {}) do
         list[#list + 1] = entry
     end
     table.sort(list, function(a, b)
         if a.value ~= b.value then return a.value > b.value end
-        return a.id < b.id
+        return (a.id or 0) < (b.id or 0)
     end)
     return list
 end
 
 local function AddCategory(category)
     GameTooltip:AddLine(" ")
-    GameTooltip:AddDoubleLine(IconText(ICON[category]) .. " " .. L[category], Money(db.gold[category]),
+    GameTooltip:AddDoubleLine(IconText(ICON[category]) .. " " .. L[category], Money(db.gold[category] or 0),
         1, 0.82, 0, 1, 1, 1)
 
     local items = SortedItems(category)
@@ -316,18 +344,30 @@ local function AddCategory(category)
     for i = 1, math.min(#items, shown) do
         local entry = items[i]
         local icon = C_Item.GetItemIconByID(entry.id)
-        GameTooltip:AddDoubleLine(("%s %s x%d"):format(icon and IconText(icon) or "", entry.link, entry.count),
+        local tag = entry.source == "vendor" and (" " .. GREY:format("[V]")) or ""
+        GameTooltip:AddDoubleLine(("%s %s x%d%s"):format(icon and IconText(icon) or "", entry.link, entry.count, tag),
             Money(entry.value), 1, 1, 1, 1, 1, 1)
     end
     if #items > shown then
         GameTooltip:AddLine(L.more:format(#items - shown), 0.6, 0.6, 0.6)
     end
-    if db.coin[category] > 0 then
+    if (db.coin[category] or 0) > 0 then
         GameTooltip:AddDoubleLine(L.coins, Money(db.coin[category]), 1, 1, 1, 1, 1, 1)
     end
-    if #items == 0 and db.coin[category] == 0 then
+    if #items == 0 and (db.coin[category] or 0) == 0 then
         GameTooltip:AddLine(L.nothing, 0.6, 0.6, 0.6)
     end
+end
+
+local function SessionVendorTotal()
+    local vendor = 0
+    for _, category in ipairs(CATEGORIES) do
+        vendor = vendor + (db.coin[category] or 0)
+        for _, entry in pairs(db.items[category] or {}) do
+            vendor = vendor + (entry.vendorValue or 0)
+        end
+    end
+    return vendor
 end
 
 local function FillTooltip()
@@ -335,14 +375,82 @@ local function FillTooltip()
     GameTooltip:AddLine("GoldPerHour")
     GameTooltip:AddDoubleLine(L.session, ("%s (%s)"):format(Clock(Elapsed()), running and L.running or L.paused),
         1, 1, 1, 1, 1, 1)
+
+    local anyCat = false
     for _, category in ipairs(CATEGORIES) do
-        if not tooltip.category or tooltip.category == category then AddCategory(category) end
+        local showCat = (tooltip.category == category)
+            or (not tooltip.category and ((db.gold[category] or 0) > 0 or category == HERB or category == LOOT))
+        if showCat then
+            AddCategory(category)
+            anyCat = true
+        end
     end
+    if not anyCat then AddCategory(LOOT) end
+
+    local vendorTotal = SessionVendorTotal()
+    if vendorTotal > 0 and TotalGold() > 0 then
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddDoubleLine(L.vendorShare, Money(vendorTotal), 0.75, 0.75, 0.75, 0.85, 0.85, 0.85)
+    end
+
+    -- Top zones of the running session
+    local zList = {}
+    for zName, zVal in pairs((db.session and db.session.zones) or {}) do
+        if zVal > 0 then zList[#zList + 1] = { name = zName, val = zVal } end
+    end
+    if #zList > 0 then
+        table.sort(zList, function(a, b) return a.val > b.val end)
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine(L.zones, 1, 0.82, 0)
+        for i = 1, math.min(#zList, 3) do
+            GameTooltip:AddDoubleLine(zList[i].name, Money(zList[i].val), 0.9, 0.9, 0.9, 1, 1, 1)
+        end
+    end
+
+    -- Compact today, AH 7d & wealth summary.
+    GameTooltip:AddLine(" ")
+    local todayLoot, todayInc, todayExp, todayNet = ns.Ledger.TodayTotals()
+    local netStr = todayNet == 0 and Money(0)
+        or (todayNet > 0 and GREEN:format("+" .. Money(todayNet)) or RED:format("-" .. Money(-todayNet)))
+    GameTooltip:AddDoubleLine(L.today, Money(todayLoot) .. " " .. GREY:format("(") .. netStr .. GREY:format(")"),
+        1, 0.82, 0, 1, 1, 1)
+    if todayInc > 0 or todayExp > 0 then
+        GameTooltip:AddDoubleLine("  " .. L.income .. " / " .. L.expense,
+            GREEN:format("+" .. Money(todayInc)) .. " " .. GREY:format("/") .. " " .. RED:format("-" .. Money(todayExp)),
+            0.7, 0.7, 0.7, 1, 1, 1)
+    end
+
+    -- AH 7-day summary
+    local cutoff7 = time() - 7 * 86400
+    local ahNet7, ahCount7 = 0, 0
+    for _, e in ipairs(db.ledger or {}) do
+        if e and e.kind == "ah" and e.dir == "in" and (e.t or 0) >= cutoff7 then
+            ahNet7 = ahNet7 + (e.amount or 0)
+            ahCount7 = ahCount7 + 1
+        end
+    end
+    if ahCount7 > 0 then
+        GameTooltip:AddDoubleLine(L.ahSales .. " (7d)", GREEN:format(Money(ahNet7)) .. " " .. GREY:format("(" .. ahCount7 .. ")"),
+            0.75, 0.85, 1, 1, 1, 1)
+    end
+
+    local accTotal = ns.Wealth.Total()
+    local charGold = ns.Wealth.CharMoney()
+    local delta24 = ns.Wealth.Delta(db.wealth and db.wealth.accountHistory, 86400, accTotal)
+    local deltaStr = ""
+    if delta24 and delta24 ~= 0 then
+        deltaStr = " " .. GREY:format("(") .. (delta24 > 0 and GREEN:format("+" .. Money(delta24)) or RED:format("-" .. Money(-delta24))) .. GREY:format(")")
+    end
+    GameTooltip:AddDoubleLine(L.wealthChar .. " / " .. L.wealthAccount,
+        Money(charGold) .. " " .. GREY:format("/") .. " " .. Money(accTotal) .. deltaStr,
+        0.75, 0.85, 1, 1, 1, 1)
+
     GameTooltip:AddLine(" ")
     if Setting("priceSource") == "vendor" then
         GameTooltip:AddDoubleLine(L.prices, L.vendorSetting, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6)
-    elseif AuctionatorAPI() then
-        GameTooltip:AddDoubleLine(L.prices, L.auction, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6)
+    elseif ns.AuctionatorAPI() then
+        GameTooltip:AddDoubleLine(L.prices, Setting("deductAhCut") and L.auctionCut or L.auction,
+            0.6, 0.6, 0.6, 0.6, 0.6, 0.6)
     else
         GameTooltip:AddDoubleLine(L.prices, L.vendorOnly, 0.6, 0.6, 0.6, 1, 0.3, 0.3)
     end
@@ -350,7 +458,6 @@ local function FillTooltip()
     GameTooltip:Show()
 end
 
--- The item tooltip sits below the window, or above it when the window is near the bottom of the screen.
 local function ShowTooltip(owner, category)
     tooltip.owner, tooltip.category = owner, category
     GameTooltip:SetOwner(owner, "ANCHOR_NONE")
@@ -362,7 +469,6 @@ local function ShowTooltip(owner, category)
     FillTooltip()
 end
 
--- A button's tooltip: what it does in white and gold, the slash command in grey.
 local function ButtonTooltip(button, heading, text, command)
     tooltip.owner, tooltip.category = nil, nil
     GameTooltip:SetOwner(button, "ANCHOR_TOP")
@@ -381,21 +487,31 @@ local function ToggleTooltip(button)
 end
 
 ---------------------------------------------------------------------------
--- Display
+-- Display (dynamic category bars)
 ---------------------------------------------------------------------------
 local function HasSession()
-    return running or db.elapsed > 0 or db.gold[HERB] + db.gold[LOOT] > 0
+    return running or db.elapsed > 0 or TotalGold() > 0
 end
 
--- "running" (the clock ticks), "paused" (a session with time or gold that is stopped) or "idle" (nothing yet).
 local function State()
     if running then return "running" end
     return HasSession() and "paused" or "idle"
 end
 
+local function VisibleCategories()
+    local active = {}
+    for _, category in ipairs(CATEGORIES) do
+        if (db.gold[category] or 0) > 0 then
+            active[#active + 1] = category
+        end
+    end
+    if #active == 0 then return DEFAULT_BARS end
+    return active
+end
+
 local function Refresh()
     if not db then return end
-    local total = db.gold[HERB] + db.gold[LOOT]
+    local total = TotalGold()
     local elapsed = Elapsed()
     local state = State()
     ns.ui.state = state
@@ -420,8 +536,15 @@ local function Refresh()
         end
     end
 
-    for _, category in ipairs(CATEGORIES) do
-        local bar, gold = bars[category], db.gold[category]
+    local visible = VisibleCategories()
+    local visibleSet = {}
+    for i, category in ipairs(visible) do
+        visibleSet[category] = true
+        local bar, gold = bars[category], db.gold[category] or 0
+        local y = -(TITLE_HEIGHT + 47) - (i - 1) * (BAR_HEIGHT + BAR_GAP)
+        bar:ClearAllPoints()
+        bar:SetPoint("TOPLEFT", PAD, y)
+        bar:SetPoint("TOPRIGHT", -PAD, y)
         local share = total > 0 and gold / total or 0
         bar:SetValue(share)
         if gold > 0 then
@@ -429,13 +552,34 @@ local function Refresh()
         else
             bar.amount:SetText(GREY:format("-"))
         end
+        bar:Show()
     end
+    for _, category in ipairs(CATEGORIES) do
+        if not visibleSet[category] then
+            bars[category]:SetValue(0)
+            bars[category]:Hide()
+        end
+    end
+    frame:SetHeight(BASE_HEIGHT + #visible * (BAR_HEIGHT + BAR_GAP))
+    ns.ui.visibleBars = visible
+
+    local todayLoot = ns.Ledger.TodayTotals()
+    local accTotal = ns.Wealth.Total()
+    footerLeft:SetText(GREY:format(L.today .. ":") .. " " .. Money(todayLoot))
+    footerRight:SetText(GREY:format(L.wealthAccount .. ":") .. " " .. Money(accTotal))
 
     toggleButton:SetNormalTexture(running and TEXTURE.pause or TEXTURE.play)
     resetButton:SetEnabled(HasSession())
     titleIcon:SetDesaturated(not running)
 
     if tooltip.owner and GameTooltip:IsOwned(tooltip.owner) then FillTooltip() end
+end
+
+function ns.ApplyLiveSettings()
+    if not db then return end
+    frame:SetScale(Setting("scale"))
+    frame:SetShown(not db.hidden)
+    Refresh()
 end
 
 local function SetVisible(shown)
@@ -470,19 +614,23 @@ end
 
 -- A finished session goes into db.history for the app; the item links are reduced to name and quality.
 local function Archive()
-    if db.elapsed < 1 and db.gold[HERB] + db.gold[LOOT] == 0 then return end
+    if db.elapsed < 1 and TotalGold() == 0 then return end
     local entry = {
         started = db.session.started, ended = db.session.lastActive or time(), archived = time(),
         elapsed = math.floor(db.elapsed), gold = {}, coin = {}, items = {},
         zones = db.session.zones, chars = db.session.chars, samples = db.session.samples,
     }
     for _, category in ipairs(CATEGORIES) do
-        entry.gold[category] = math.floor(db.gold[category] + 0.5)
-        entry.coin[category] = db.coin[category]
+        entry.gold[category] = math.floor((db.gold[category] or 0) + 0.5)
+        entry.coin[category] = db.coin[category] or 0
         local list = {}
         for _, item in ipairs(SortedItems(category)) do
-            list[#list + 1] = { id = item.id, name = item.link:match("%[(.-)%]"), quality = item.quality,
-                count = item.count, value = math.floor(item.value + 0.5) }
+            list[#list + 1] = {
+                id = item.id, name = item.link:match("%[(.-)%]"), quality = item.quality,
+                count = item.count, value = math.floor(item.value + 0.5),
+                vendorValue = math.floor((item.vendorValue or 0) + 0.5),
+                source = item.source,
+            }
         end
         entry.items[category] = list
     end
@@ -517,61 +665,99 @@ StaticPopupDialogs["GOLDPERHOUR_RESET"] = {
 }
 
 ---------------------------------------------------------------------------
--- Crediting
+-- Crediting (always-on ledger + optional live session)
 ---------------------------------------------------------------------------
-local function CreditMoney(category, copper)
-    db.coin[category] = db.coin[category] + copper
-    db.gold[category] = db.gold[category] + copper
+local function CreditSessionMoney(category, copper)
+    if not running then return end
+    db.coin[category] = (db.coin[category] or 0) + copper
+    db.gold[category] = (db.gold[category] or 0) + copper
     local zone, char = Where()
     Attribute(zone, char, copper)
     Refresh()
 end
 
-local function CreditItem(category, link, quantity)
+local function CreditSessionItem(category, id, link, quality, quantity, value, vendorValue, source, zone)
+    if not running then return end
+    local _, char = Where()
+    local entry = db.items[category][id]
+    if not entry then
+        entry = { id = id, link = link, count = 0, value = 0, vendorValue = 0, source = source }
+        db.items[category][id] = entry
+    end
+    entry.quality = quality
+    entry.count = entry.count + quantity
+    entry.value = entry.value + value
+    entry.vendorValue = (entry.vendorValue or 0) + vendorValue
+    entry.source = source
+    db.gold[category] = (db.gold[category] or 0) + value
+    Attribute(zone, char, value)
+    Refresh()
+end
+
+local function HandleLootItem(category, link, quantity, creditSession)
     local item = Item:CreateFromItemLink(link)
     if item:IsItemEmpty() then return end
-    local zone, char = Where()
-    -- Sell price and quality are only available once the item is cached.
+    local zone = Where()
+    local charKey = ns.CharKey()
     item:ContinueOnItemLoad(function()
         local id = item:GetItemID()
-        local unit, quality = ItemValue(link)
+        local name = link:match("%[(.-)%]")
+        local unit, vendorUnit, quality, source = ns.ItemValue(link)
         local value = unit * quantity
-        local entry = db.items[category][id]
-        if not entry then
-            entry = { id = id, link = link, count = 0, value = 0 }
-            db.items[category][id] = entry
+        local vendorValue = vendorUnit * quantity
+        ns.Ledger.RecordLootItem(category, id, link, name, quality, quantity, value, vendorValue, source, zone, charKey)
+        if creditSession then
+            CreditSessionItem(category, id, link, quality, quantity, value, vendorValue, source, zone)
         end
-        entry.quality = quality
-        entry.count = entry.count + quantity
-        entry.value = entry.value + value
-        db.gold[category] = db.gold[category] + value
-        Attribute(zone, char, value)
-        Refresh()
     end)
 end
 
 ---------------------------------------------------------------------------
--- Classification
+-- Classification (Herbalism, Mining, Skinning, Fishing, Loot)
 ---------------------------------------------------------------------------
-local function IsHerbSpell(spellID)
-    if spellID == HERB_GATHERING or db.herbSpells[spellID] then return true end
-    -- Other ranks or variants share the localized name of the base spell.
-    local herbName = C_Spell.GetSpellName(HERB_GATHERING)
-    return herbName ~= nil and C_Spell.GetSpellName(spellID) == herbName
+local function SpellMatchesName(spellID, baseSpellID)
+    if not C_Spell or not C_Spell.GetSpellName then return false end
+    local baseName = C_Spell.GetSpellName(baseSpellID)
+    return baseName ~= nil and C_Spell.GetSpellName(spellID) == baseName
 end
 
--- Herbs: the last cast was a herb gathering cast and every slot comes from a world object.
-local function ClassifyLoot(slotCount)
-    if not lastCast.herb or GetTime() - lastCast.at > CAST_WINDOW then return LOOT end
+local function ClassifyGatherSpell(spellID)
+    if spellID == HERB_GATHERING or db.herbSpells[spellID] or SpellMatchesName(spellID, HERB_GATHERING) then
+        return HERB
+    end
+    if MINING_SPELLS[spellID] or db.miningSpells[spellID] or SpellMatchesName(spellID, MINING_BASE) then
+        return MINING
+    end
+    if spellID == SKINNING_BASE or SpellMatchesName(spellID, SKINNING_BASE) then
+        return SKINNING
+    end
+    if spellID == FISHING_BASE or SpellMatchesName(spellID, FISHING_BASE) then
+        return FISHING
+    end
+    return nil
+end
+
+local function AllSourcesMatch(slotCount, expectedPrefix)
     local seen = false
     for slot = 1, slotCount do
         if LootSlotHasItem(slot) then
             local guid = GetLootSourceInfo(slot)
-            if not guid or IsSecret(guid) or strsplit("-", guid) ~= "GameObject" then return LOOT end
+            if not guid or IsSecret(guid) or strsplit("-", guid) ~= expectedPrefix then return false end
             seen = true
         end
     end
-    return seen and HERB or LOOT
+    return seen
+end
+
+local function ClassifyLoot(slotCount)
+    if IsFishingLoot and IsFishingLoot() then return FISHING end
+    local recentCast = lastCast.kind and (GetTime() - lastCast.at <= CAST_WINDOW)
+    if not recentCast then return LOOT end
+    if lastCast.kind == FISHING then return FISHING end
+    if lastCast.kind == HERB and AllSourcesMatch(slotCount, "GameObject") then return HERB end
+    if lastCast.kind == MINING and AllSourcesMatch(slotCount, "GameObject") then return MINING end
+    if lastCast.kind == SKINNING and AllSourcesMatch(slotCount, "Creature") then return SKINNING end
+    return LOOT
 end
 
 -- LOOT_READY and LOOT_OPENED both land here and may repeat, so this must be idempotent.
@@ -610,6 +796,7 @@ function handlers.ADDON_LOADED(name)
     db = GoldPerHourDB
     db.elapsed = db.elapsed or 0
     db.herbSpells = db.herbSpells or {}
+    db.miningSpells = db.miningSpells or {}
     db.gold, db.coin, db.items = db.gold or {}, db.coin or {}, db.items or {}
     for _, category in ipairs(CATEGORIES) do
         db.gold[category] = db.gold[category] or 0
@@ -623,6 +810,10 @@ function handlers.ADDON_LOADED(name)
     db.session.chars = db.session.chars or {}
     db.session.samples = db.session.samples or {}
     db.version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON, "Version") or nil
+
+    ns.Wealth.Init(db)
+    ns.Ledger.Init(db)
+    ns.Stats.Init(db)
 
     frame:SetScale(Setting("scale"))
     frame:ClearAllPoints()
@@ -640,7 +831,6 @@ function handlers.PLAYER_LOGIN()
 end
 
 -- Requests from the desktop app (AppRequest.lua in this folder, read by the client on /reload).
--- Each id runs once; the result goes to db.lastRequest, which the app reads after the next /reload.
 local function ApplySettings(s)
     for key, default in pairs(DEFAULTS) do
         local value = s[key]
@@ -649,10 +839,28 @@ local function ApplySettings(s)
     db.settings.scale = math.min(2, math.max(0.5, Setting("scale")))
     db.settings.tooltipItems = math.min(30, math.max(1, math.floor(Setting("tooltipItems"))))
     if db.settings.priceSource ~= "vendor" then db.settings.priceSource = "auctionator" end
+    if db.settings.ahMinValue ~= nil then
+        db.settings.ahMinValue = math.max(0, math.floor(db.settings.ahMinValue))
+    end
+    if db.settings.wealthInterval ~= nil then
+        db.settings.wealthInterval = math.min(3600, math.max(60, math.floor(db.settings.wealthInterval)))
+    end
+    if db.settings.minDropQuality ~= nil then
+        db.settings.minDropQuality = math.min(5, math.max(0, math.floor(db.settings.minDropQuality)))
+    end
+    if db.settings.minDropValue ~= nil then
+        db.settings.minDropValue = math.max(0, math.floor(db.settings.minDropValue))
+    end
     if type(s.herbSpells) == "table" then
         wipe(db.herbSpells)
         for _, id in ipairs(s.herbSpells) do
             if tonumber(id) then db.herbSpells[tonumber(id)] = true end
+        end
+    end
+    if type(s.miningSpells) == "table" then
+        wipe(db.miningSpells)
+        for _, id in ipairs(s.miningSpells) do
+            if tonumber(id) then db.miningSpells[tonumber(id)] = true end
         end
     end
     frame:SetScale(Setting("scale"))
@@ -688,8 +896,11 @@ end
 
 local entered = false
 function handlers.PLAYER_ENTERING_WORLD(_, isReloadingUi)
+    ns.Ledger.CheckInstance()
     if entered then return end -- fires again on every loading screen
     entered = true
+    lastMoney = GetMoney()
+    ns.Wealth.Record("login")
     if isReloadingUi and db.resume and Setting("resumeAfterReload") then
         Start()
         Print(L.resumed)
@@ -698,8 +909,14 @@ function handlers.PLAYER_ENTERING_WORLD(_, isReloadingUi)
     RunAppRequest()
 end
 
+function handlers.ZONE_CHANGED_NEW_AREA()
+    ns.Ledger.CheckInstance()
+end
+
 function handlers.PLAYER_LOGOUT()
     -- GetTime() does not survive a logout, so the session pauses. On /reload it continues (resumeAfterReload).
+    -- Do NOT call GetMoney() here: WoW Forever tears down character money before PLAYER_LOGOUT.
+    ns.Wealth.FlushPending()
     db.resume = running or nil
     Stop()
     db.updated = time()
@@ -709,9 +926,9 @@ function handlers.UNIT_SPELLCAST_SENT(unit, _, _, spellID)
     if unit ~= "player" then return end
     local secret = IsSecret(spellID)
     lastCast.at = GetTime()
-    lastCast.herb = not secret and IsHerbSpell(spellID)
+    lastCast.kind = (not secret) and ClassifyGatherSpell(spellID) or nil
     if debug and not secret then
-        Print("cast:", spellID, C_Spell.GetSpellName(spellID), lastCast.herb and "(herb)" or "")
+        Print("cast:", spellID, C_Spell.GetSpellName(spellID), lastCast.kind and ("(" .. lastCast.kind .. ")") or "")
     end
 end
 
@@ -722,32 +939,67 @@ function handlers.LOOT_SLOT_CLEARED(slot)
     local entry = loot.slots[slot]
     if not entry then return end
     loot.slots[slot] = nil
-    if running then
-        CreditItem(loot.category, entry.link, entry.quantity)
-    end
+    HandleLootItem(loot.category or LOOT, entry.link, entry.quantity, running)
 end
 
 function handlers.LOOT_CLOSED()
     -- Slots are wiped on the next open, so a late LOOT_SLOT_CLEARED still counts.
     loot.open = false
     loot.moneyUntil = GetTime() + MONEY_GRACE
-    lastCast.herb = false
+    lastCast.kind = nil
+end
+
+function handlers.LOOT_ITEM_ROLL_WON(itemLink, rollQuantity)
+    ns.Ledger.OnLootRollWon(itemLink, rollQuantity, CreditSessionItem)
+end
+
+function handlers.CHAT_MSG_MONEY(text)
+    ns.Ledger.OnChatMsgMoney(text, loot, CreditSessionMoney)
 end
 
 function handlers.PLAYER_MONEY()
     local money = GetMoney()
+    if type(money) ~= "number" or IsSecret(money) then return end
     local delta = lastMoney and (money - lastMoney) or 0
     lastMoney = money
-    if running and delta > 0 and loot.category and (loot.open or GetTime() <= loot.moneyUntil) then
-        CreditMoney(loot.category, delta)
+    if delta ~= 0 then
+        ns.Ledger.OnPlayerMoney(delta, loot, CreditSessionMoney)
+        ns.Wealth.OnMoneyChanged()
     end
 end
 
+function handlers.ACCOUNT_MONEY()
+    ns.Wealth.OnAccountMoney()
+end
+
+function handlers.QUEST_TURNED_IN(questID, xpReward, moneyReward)
+    ns.Ledger.OnQuestTurnedIn(questID, xpReward, moneyReward)
+end
+
+function handlers.MERCHANT_SHOW() ns.Ledger.SetContext("merchant", true) end
+function handlers.MERCHANT_CLOSED() ns.Ledger.SetContext("merchant", false) end
+function handlers.MAIL_SHOW() ns.Ledger.SetContext("mail", true) end
+function handlers.MAIL_CLOSED() ns.Ledger.SetContext("mail", false) end
+function handlers.MAIL_INBOX_UPDATE() ns.Ledger.ScanPendingInbox() end
+function handlers.AUCTION_HOUSE_SHOW() ns.Ledger.SetContext("ah", true) end
+function handlers.AUCTION_HOUSE_CLOSED() ns.Ledger.SetContext("ah", false) end
+function handlers.AUCTION_HOUSE_AUCTION_CREATED() ns.Ledger.OnAuctionCreated() end
+function handlers.OWNED_AUCTIONS_UPDATED() ns.Ledger.ScanOwnedAuctions() end
+function handlers.TAXIMAP_OPENED() ns.Ledger.SetContext("taxi", true) end
+function handlers.TAXIMAP_CLOSED() ns.Ledger.SetContext("taxi", false) end
+function handlers.TRAINER_SHOW() ns.Ledger.SetContext("trainer", true) end
+function handlers.TRAINER_CLOSED() ns.Ledger.SetContext("trainer", false) end
+function handlers.TRADE_SHOW() ns.Ledger.SetContext("trade", true) end
+function handlers.TRADE_CLOSED() ns.Ledger.SetContext("trade", false) end
+function handlers.PLAYER_INTERACTION_MANAGER_FRAME_SHOW(itype) ns.Ledger.OnPlayerInteraction(itype, true) end
+function handlers.PLAYER_INTERACTION_MANAGER_FRAME_HIDE(itype) ns.Ledger.OnPlayerInteraction(itype, false) end
+
 frame:SetScript("OnEvent", function(_, event, ...)
-    handlers[event](...)
+    local fn = handlers[event]
+    if fn then fn(...) end
 end)
 for event in pairs(handlers) do
-    frame:RegisterEvent(event)
+    pcall(frame.RegisterEvent, frame, event)
 end
 
 ---------------------------------------------------------------------------
@@ -769,15 +1021,20 @@ end
 
 frame:SetScript("OnDragStart", StartMoving)
 frame:SetScript("OnDragStop", StopMoving)
+frame:SetScript("OnMouseUp", function(_, button)
+    if button == "RightButton" then ns.Stats.Toggle() end
+end)
 frame:SetScript("OnEnter", function(self)
     ShowTooltip(self)
 end)
 frame:SetScript("OnLeave", HideTooltip)
 
--- A bar shows the items of its category; dragging it moves the window.
 for _, bar in pairs(bars) do
     bar:SetScript("OnDragStart", StartMoving)
     bar:SetScript("OnDragStop", StopMoving)
+    bar:SetScript("OnMouseUp", function(_, button)
+        if button == "RightButton" then ns.Stats.Toggle() end
+    end)
     bar:SetScript("OnEnter", function(self)
         ShowTooltip(self, self.category)
     end)
@@ -793,11 +1050,18 @@ frame:SetScript("OnUpdate", function(_, dt)
     end
 end)
 
--- The gold curve also grows while the window is hidden (OnUpdate only runs for shown frames).
+-- Periodic ticker (runs even while the window is hidden): session curve, wealth interval & zone time.
+local zoneTickAccum = 0
 C_Timer.NewTicker(5, function()
     if running and Elapsed() >= nextSample then
         Sample()
         nextSample = nextSample + SAMPLE_EVERY
+    end
+    ns.Wealth.OnTicker()
+    zoneTickAccum = zoneTickAccum + 5
+    if zoneTickAccum >= 60 then
+        ns.Ledger.TickZone(zoneTickAccum)
+        zoneTickAccum = 0
     end
 end)
 
@@ -818,7 +1082,7 @@ toggleButton:SetScript("OnEnter", ToggleTooltip)
 toggleButton:SetScript("OnLeave", HideTooltip)
 
 resetButton:SetScript("OnClick", function()
-    if Elapsed() > 0 or db.gold[HERB] + db.gold[LOOT] > 0 then
+    if Elapsed() > 0 or TotalGold() > 0 then
         StaticPopup_Show("GOLDPERHOUR_RESET")
     end
 end)
@@ -826,6 +1090,14 @@ resetButton:SetScript("OnEnter", function(self)
     ButtonTooltip(self, L.reset, L.resetTip, "/gph reset")
 end)
 resetButton:SetScript("OnLeave", HideTooltip)
+
+statsButton:SetScript("OnClick", function()
+    ns.Stats.Toggle()
+end)
+statsButton:SetScript("OnEnter", function(self)
+    ButtonTooltip(self, L.stats, L.statsTip, "/gph stats")
+end)
+statsButton:SetScript("OnLeave", HideTooltip)
 
 function GoldPerHour_OnAddonCompartmentClick()
     SetVisible(not frame:IsShown())
@@ -848,12 +1120,27 @@ SlashCmdList.GOLDPERHOUR = function(msg)
         SetVisible(true)
     elseif cmd == "hide" then
         SetVisible(false)
+    elseif cmd == "stats" then
+        ns.Stats.Toggle()
+    elseif cmd == "wealth" then
+        ns.Stats.Show("wealth")
+    elseif cmd == "ah" then
+        ns.Stats.Show("ah")
+    elseif cmd == "loot" or cmd == "history" then
+        ns.Stats.Show("loot")
+    elseif cmd == "cashflow" then
+        ns.Stats.Show("cashflow")
+    elseif cmd == "settings" then
+        ns.Stats.Show("settings")
     elseif cmd == "debug" then
         debug = not debug
         Print(debug and L.debugOn or L.debugOff)
     elseif cmd == "herbid" and tonumber(arg) then
         db.herbSpells[tonumber(arg)] = true
         Print(L.herbAdded:format(tonumber(arg)))
+    elseif cmd == "miningid" and tonumber(arg) then
+        db.miningSpells[tonumber(arg)] = true
+        Print(L.miningAdded:format(tonumber(arg)))
     else
         Print(L.usage)
     end
